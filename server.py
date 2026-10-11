@@ -1,20 +1,24 @@
 import os
+import re
+import gc
 import time
 import json
 import asyncio
 import tempfile
 import subprocess
-from typing import Optional
+from typing import Optional, List, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
+import mlx.core as mx
 from mlx_audio.stt import load
 
 from moss_transcribe_diarize import parse_transcript
 from moss_transcribe_diarize.transcript_parser import TranscriptStreamParser
 
-app = FastAPI(title="MOSS Transcribe & Diarize Service on Apple Silicon MLX")
+app = FastAPI(title="MOSS Transcribe & Diarize Service on Apple Silicon MLX (VAD Chunked)")
 
 MODEL_ID = os.environ.get("MOSS_MODEL_ID", "vanch007/mlx-MOSS-Transcribe-Diarize")
+TARGET_CHUNK_SEC = int(os.environ.get("MOSS_CHUNK_SEC", "600"))  # 默认 10 分钟切片
 
 print(f"[MOSS Server] Initializing MLX backend with model: {MODEL_ID}...")
 t_load = time.time()
@@ -34,17 +38,73 @@ def get_audio_duration(file_path: str) -> float:
     except Exception:
         return 0.0
 
-def _run_inference(audio_path: str, prompt_text: Optional[str], max_tokens: int):
-    t0 = time.time()
+def find_vad_splits(audio_path: str, total_dur: float, target_chunk_sec: int = 600, window_sec: int = 60) -> List[float]:
+    """使用 ffmpeg silencedetect 在目标切割点附近寻找最自然的静音停顿"""
+    if total_dur <= target_chunk_sec * 1.2:
+        return [0.0, round(total_dur, 2)]
+
+    splits = [0.0]
+    cur = 0.0
+    while cur + target_chunk_sec < total_dur:
+        win_start = max(cur, cur + target_chunk_sec - window_sec)
+        win_end = min(total_dur, cur + target_chunk_sec + window_sec)
+        
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(win_start), "-to", str(win_end),
+            "-i", audio_path,
+            "-af", "silencedetect=noise=-30dB:d=0.3",
+            "-f", "null", "-"
+        ]
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+        starts = [float(x) + win_start for x in re.findall(r"silence_start: ([\d\.]+)", res.stderr)]
+        ends = [float(x) + win_start for x in re.findall(r"silence_end: ([\d\.]+)", res.stderr)]
+        
+        best_split = cur + target_chunk_sec
+        if starts and ends:
+            silences = [(s, e, (s + e) / 2.0) for s, e in zip(starts, ends) if e > s]
+            if silences:
+                silences.sort(key=lambda x: abs(x[2] - (cur + target_chunk_sec)))
+                best_split = round(silences[0][2], 2)
+
+        splits.append(best_split)
+        cur = best_split
+
+    splits.append(round(total_dur, 2))
+    return sorted(list(set(splits)))
+
+def slice_audio(audio_path: str, start_sec: float, dur_sec: float, out_path: str):
+    """无损切片音频，保持相同容器封装"""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_sec),
+        "-t", str(dur_sec),
+        "-i", audio_path,
+        "-c:a", "copy",
+        out_path
+    ]
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def clean_mlx_memory():
+    """强制清理 Python 与 MLX 统一显存缓存"""
+    gc.collect()
+    try:
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            mx.metal.clear_cache()
+    except Exception:
+        pass
+
+def _run_inference_chunk(audio_path: str, prompt_text: Optional[str], max_tokens: int):
     kwargs = {"max_tokens": max_tokens}
     if prompt_text and prompt_text.strip():
         kwargs["prompt"] = prompt_text.strip()
 
+    t0 = time.time()
     res = model.generate(audio_path, **kwargs)
     cost = time.time() - t0
 
     raw_text = getattr(res, "text", "") or ""
-    
     segments = []
     if hasattr(res, "segments") and res.segments:
         for s in res.segments:
@@ -68,86 +128,168 @@ def _run_inference(audio_path: str, prompt_text: Optional[str], max_tokens: int)
 
     gen_tokens = getattr(res, "generation_tokens", 0) or 0
     tps = getattr(res, "generation_tps", 0.0) or 0.0
+    return raw_text, segments, cost, gen_tokens, tps
+
+def _run_pipeline(audio_path: str, prompt_text: Optional[str], max_tokens: Optional[int]):
+    m_tokens = max_tokens or 16384
+    duration = get_audio_duration(audio_path)
+    splits = find_vad_splits(audio_path, duration, target_chunk_sec=TARGET_CHUNK_SEC)
+    
+    all_segments = []
+    full_text_parts = []
+    total_tokens = 0
+    t0 = time.time()
+
+    prev_context = prompt_text or ""
+
+    for i in range(len(splits) - 1):
+        c_start = splits[i]
+        c_end = splits[i + 1]
+        c_dur = c_end - c_start
+        if c_dur <= 0.1:
+            continue
+
+        ext = os.path.splitext(audio_path)[1] or ".mp3"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as chunk_tmp:
+            chunk_path = chunk_tmp.name
+
+        try:
+            slice_audio(audio_path, c_start, c_dur, chunk_path)
+            raw_text, segs, cost, tokens, tps = _run_inference_chunk(chunk_path, prev_context, m_tokens)
+            total_tokens += tokens
+            full_text_parts.append(raw_text)
+
+            # 加上时间基准偏移
+            for s in segs:
+                s["start"] = round(s["start"] + c_start, 2)
+                s["end"] = round(s["end"] + c_start, 2)
+                all_segments.append(s)
+
+            # 取最后两句话作为下一个 chunk 的上下文提示
+            if segs:
+                prev_context = " ".join([s["text"] for s in segs[-2:]])
+        finally:
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+            clean_mlx_memory()
+
+    total_cost = round(time.time() - t0, 2)
+    overall_tps = round(total_tokens / total_cost, 2) if total_cost > 0 else 0.0
 
     return {
-        "text": raw_text,
-        "segments": segments,
-        "cost_seconds": round(cost, 2),
-        "generated_tokens": gen_tokens,
-        "tokens_per_second": round(tps, 2),
+        "text": "".join(full_text_parts),
+        "segments": all_segments,
+        "cost_seconds": total_cost,
+        "generated_tokens": total_tokens,
+        "tokens_per_second": overall_tps,
+        "chunks_processed": len(splits) - 1,
     }
 
-async def _stream_generator(tmp_path: str, prompt_text: Optional[str], max_tokens: Optional[int], auto_save_prefix: Optional[str] = None):
+async def _stream_pipeline_generator(tmp_path: str, prompt_text: Optional[str], max_tokens: Optional[int], auto_save_prefix: Optional[str] = None):
     m_tokens = max_tokens or 16384
     duration = await asyncio.to_thread(get_audio_duration, tmp_path)
-    kwargs = {"max_tokens": m_tokens, "stream": True}
-    if prompt_text and prompt_text.strip():
-        kwargs["prompt"] = prompt_text.strip()
+    splits = await asyncio.to_thread(find_vad_splits, tmp_path, duration, TARGET_CHUNK_SEC)
+    num_chunks = len(splits) - 1
 
-    parser = TranscriptStreamParser()
+    yield f"data: {json.dumps({'event': 'start', 'duration': round(duration, 2), 'chunks': num_chunks})}\n\n"
+
     t0 = time.time()
-    tokens_count = 0
-    last_end_time = 0.0
+    total_tokens = 0
     all_segments = []
-
-    # 1. 握手启动事件
-    yield f"data: {json.dumps({'event': 'start', 'duration': round(duration, 2)})}\n\n"
+    prev_context = prompt_text or ""
 
     try:
-        gen = await asyncio.to_thread(model.generate, tmp_path, **kwargs)
-        
-        while True:
-            chunk = await asyncio.to_thread(next, gen, None)
-            if chunk is None:
-                break
-            
-            tokens_count += 1
-            chunk_text = getattr(chunk, "text", "") or ""
-            new_segs = parser.feed(chunk_text)
-            
-            for seg in new_segs:
-                if seg.end > last_end_time:
-                    last_end_time = seg.end
-                pct = round(min(99.0, (last_end_time / duration * 100.0)), 1) if duration > 0 else 0.0
-                seg_dict = {
-                    "start": round(seg.start, 2),
-                    "end": round(seg.end, 2),
-                    "speaker": seg.speaker,
-                    "text": seg.text.strip().replace("\n", " "),
-                }
-                all_segments.append(seg_dict)
-                payload = {
-                    "event": "segment",
-                    "progress": pct,
-                    "currentTime": round(last_end_time, 2),
-                    "totalDuration": round(duration, 2),
-                    "segment": seg_dict,
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        
-        # 2. 解析器末尾收敛
-        parser.close()
-        remain_segs = parser.feed("")
-        for seg in remain_segs:
-            last_end_time = max(last_end_time, seg.end)
-            seg_dict = {
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "speaker": seg.speaker,
-                "text": seg.text.strip().replace("\n", " "),
-            }
-            all_segments.append(seg_dict)
-            payload = {
-                "event": "segment",
-                "progress": 100.0,
-                "currentTime": round(last_end_time, 2),
-                "totalDuration": round(duration, 2),
-                "segment": seg_dict,
-            }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        for idx in range(num_chunks):
+            c_start = splits[idx]
+            c_end = splits[idx + 1]
+            c_dur = c_end - c_start
+            if c_dur <= 0.1:
+                continue
 
-        # 服务端持久化落盘
-        saved_file = None
+            ext = os.path.splitext(tmp_path)[1] or ".mp3"
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as chunk_tmp:
+                chunk_path = chunk_tmp.name
+
+            try:
+                await asyncio.to_thread(slice_audio, tmp_path, c_start, c_dur, chunk_path)
+
+                # 使用流式解析器解析当前 chunk
+                parser = TranscriptStreamParser()
+                chunk_kwargs = {"max_tokens": m_tokens, "stream": True}
+                if prev_context and prev_context.strip():
+                    chunk_kwargs["prompt"] = prev_context.strip()
+
+                gen = await asyncio.to_thread(model.generate, chunk_path, **chunk_kwargs)
+                chunk_segs = []
+
+                while True:
+                    chunk_res = await asyncio.to_thread(next, gen, None)
+                    if chunk_res is None:
+                        break
+                    total_tokens += 1
+                    token_text = getattr(chunk_res, "text", "") or ""
+                    new_segs = parser.feed(token_text)
+                    for seg in new_segs:
+                        seg_dict = {
+                            "start": round(seg.start + c_start, 2),
+                            "end": round(seg.end + c_start, 2),
+                            "speaker": seg.speaker,
+                            "text": seg.text.strip().replace("\n", " "),
+                        }
+                        all_segments.append(seg_dict)
+                        chunk_segs.append(seg_dict)
+                        pct = round(min(99.0, (seg_dict["end"] / duration * 100.0)), 1) if duration > 0 else 0.0
+                        payload = {
+                            "event": "segment",
+                            "progress": pct,
+                            "currentTime": seg_dict["end"],
+                            "totalDuration": round(duration, 2),
+                            "chunk": f"{idx + 1}/{num_chunks}",
+                            "segment": seg_dict,
+                        }
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+                parser.close()
+                for seg in parser.feed(""):
+                    seg_dict = {
+                        "start": round(seg.start + c_start, 2),
+                        "end": round(seg.end + c_start, 2),
+                        "speaker": seg.speaker,
+                        "text": seg.text.strip().replace("\n", " "),
+                    }
+                    all_segments.append(seg_dict)
+                    chunk_segs.append(seg_dict)
+                    pct = round(min(99.0, (seg_dict["end"] / duration * 100.0)), 1) if duration > 0 else 0.0
+                    payload = {
+                        "event": "segment",
+                        "progress": pct,
+                        "currentTime": seg_dict["end"],
+                        "totalDuration": round(duration, 2),
+                        "chunk": f"{idx + 1}/{num_chunks}",
+                        "segment": seg_dict,
+                    }
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+                if chunk_segs:
+                    prev_context = " ".join([s["text"] for s in chunk_segs[-2:]])
+            finally:
+                if os.path.exists(chunk_path):
+                    os.remove(chunk_path)
+                # 关键：每跑完一个 chunk，彻底释放一次 MLX/Metal 统一显存
+                clean_mlx_memory()
+
+            # 每跑完一个分块，立即追加落盘，保证中途断开数据也不丢
+            if auto_save_prefix:
+                try:
+                    with open(f"{auto_save_prefix}.txt", "w", encoding="utf-8") as f:
+                        for s in all_segments:
+                            f.write(f"[{s['start']}s - {s['end']}s] {s['speaker']}: {s['text']}\n")
+                    with open(f"{auto_save_prefix}.json", "w", encoding="utf-8") as f:
+                        json.dump({"segments": all_segments}, f, ensure_ascii=False, indent=2)
+                except Exception as e_save:
+                    print(f"Incremental auto-save error: {e_save}")
+
+        # 每跑完一个分块，立即追加保存中间结果，防止长任务意外中断
         if auto_save_prefix:
             try:
                 with open(f"{auto_save_prefix}.txt", "w", encoding="utf-8") as f:
@@ -155,14 +297,19 @@ async def _stream_generator(tmp_path: str, prompt_text: Optional[str], max_token
                         f.write(f"[{s['start']}s - {s['end']}s] {s['speaker']}: {s['text']}\n")
                 with open(f"{auto_save_prefix}.json", "w", encoding="utf-8") as f:
                     json.dump({"segments": all_segments}, f, ensure_ascii=False, indent=2)
-                saved_file = f"{auto_save_prefix}.txt"
             except Exception as e_save:
-                print(f"Stream auto-save error: {e_save}")
+                print(f"Incremental auto-save error: {e_save}")
 
-        cost = time.time() - t0
-        tps = round(tokens_count / cost, 2) if cost > 0 else 0.0
-        yield f"data: {json.dumps({'event': 'complete', 'progress': 100.0, 'cost_seconds': round(cost, 2), 'tokens': tokens_count, 'tps': tps, 'saved_to': saved_file})}\n\n"
+        # 全部分片完成，持久化保存
+        saved_file = f"{auto_save_prefix}.txt" if auto_save_prefix else None
+
+        total_cost = round(time.time() - t0, 2)
+        overall_tps = round(total_tokens / total_cost, 2) if total_cost > 0 else 0.0
+        yield f"data: {json.dumps({'event': 'complete', 'progress': 100.0, 'cost_seconds': total_cost, 'tokens': total_tokens, 'tps': overall_tps, 'saved_to': saved_file})}\n\n"
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         yield f"data: {json.dumps({'event': 'error', 'detail': str(e)})}\n\n"
     finally:
         if os.path.exists(tmp_path):
@@ -170,13 +317,15 @@ async def _stream_generator(tmp_path: str, prompt_text: Optional[str], max_token
                 os.remove(tmp_path)
             except OSError:
                 pass
+        clean_mlx_memory()
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "backend": "mlx",
+        "backend": "mlx-vad-chunked",
         "model": MODEL_ID,
+        "chunk_sec": TARGET_CHUNK_SEC,
     }
 
 @app.post("/v1/audio/transcriptions")
@@ -187,7 +336,6 @@ async def transcribe(
     max_new_tokens: Optional[int] = Form(16384),
     stream: Optional[bool] = Query(False),
 ):
-    # 确保输出目录存在
     save_dir = os.path.expanduser("~/Documents/transcripts")
     os.makedirs(save_dir, exist_ok=True)
     orig_name = os.path.splitext(file.filename or "audio")[0]
@@ -202,13 +350,12 @@ async def transcribe(
 
     if stream:
         return StreamingResponse(
-            _stream_generator(tmp_path, prompt, max_new_tokens, auto_save_prefix),
+            _stream_pipeline_generator(tmp_path, prompt, max_new_tokens, auto_save_prefix),
             media_type="text/event-stream"
         )
 
     try:
-        data = await asyncio.to_thread(_run_inference, tmp_path, prompt, max_new_tokens)
-        # 服务端兜底自动保存一份
+        data = await asyncio.to_thread(_run_pipeline, tmp_path, prompt, max_new_tokens)
         try:
             with open(f"{auto_save_prefix}.txt", "w", encoding="utf-8") as f:
                 for seg in data.get("segments", []):
@@ -229,6 +376,7 @@ async def transcribe(
                 os.remove(tmp_path)
             except OSError:
                 pass
+        clean_mlx_memory()
 
 if __name__ == "__main__":
     import uvicorn
