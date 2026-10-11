@@ -19,3 +19,8 @@ runs/
 *.pth
 *.onnx
 *.log
+clip_test.m4a
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
